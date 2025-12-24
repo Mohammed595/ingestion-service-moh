@@ -1,0 +1,83 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingestion-config
+  namespace: aj-playground
+data:
+  CONTROL_SERVER_URL: "http://control-server:9000"
+  DATABASE_URL: "postgres://user:password@postgres-host:5432/dbname?sslmode=disable"
+  PORT: "8080"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-service
+  namespace: aj-playground
+  labels:
+    app: ingestion-service
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingestion-service
+  template:
+    metadata:
+      labels:
+        app: ingestion-service
+        version: v1
+    spec:
+      containers:
+      - name: ingestion-service
+        image: gcr.io/hungerstation-hackathon-6957/ingestion-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: ingestion-config
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-service
+  namespace: aj-playground
+  labels:
+    app: ingestion-service
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: ingestion-service
