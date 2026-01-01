@@ -4,45 +4,40 @@ on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'infra/k8s/**'
+      - '.github/**'
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: [self-hosted]
 
     container:
-      image: gcr.io/cloud-builders/docker
+      image: google/cloud-sdk:slim
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
-        - ${{ github.workspace }}:/github/workspace
-
-    defaults:
-      run:
-        working-directory: /github/workspace
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install gcloud CLI
+      - name: Install Docker CLI
         run: |
           apt-get update
-          apt-get install -y curl apt-transport-https ca-certificates gnupg lsb-release
-          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
-            > /etc/apt/sources.list.d/google-cloud-sdk.list
-          curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-            | gpg --dearmor > /usr/share/keyrings/cloud.google.gpg
-          apt-get update
-          apt-get install -y google-cloud-cli git
-          
+          apt-get install -y docker.io
+
       - name: Set image name
         id: vars
         run: |
           REPO_NAME=$(basename "$GITHUB_REPOSITORY")
           IMAGE="europe-west1-docker.pkg.dev/hungerstation-hackathon-6957/build-day-25-repo/${REPO_NAME}:${GITHUB_SHA}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-          
+
       - name: Build image
         run: docker build -t "${{ steps.vars.outputs.image }}" .
-        
+
       - name: Push image
         run: |
           gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
@@ -54,8 +49,9 @@ jobs:
 
       - name: Commit updated manifest back to repo
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
           git add infra/k8s/base.yaml
           git commit -m "chore: update ingestion-service image to ${GITHUB_SHA}" || echo "No changes to commit"
           git push origin HEAD:${GITHUB_REF#refs/heads/} --force
