@@ -26,7 +26,7 @@ jobs:
           curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
             | gpg --dearmor > /usr/share/keyrings/cloud.google.gpg
           apt-get update
-          apt-get install -y google-cloud-cli
+          apt-get install -y google-cloud-cli git
           
       - name: Set image name
         id: vars
@@ -49,6 +49,7 @@ jobs:
 
       - name: Commit updated manifest back to repo
         run: |
+          apt-get update && apt-get install -y git
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add infra/k8s/base.yaml
