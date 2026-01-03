@@ -36,7 +36,7 @@ func handlePostDeliveryEvent(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		logger.Error("failed to read request body", map[string]interface{}{
+		logger.Error("failed to read request body <>", map[string]interface{}{
 			"error": err.Error(),
 		})
 		w.WriteHeader(http.StatusBadRequest)
@@ -79,7 +79,7 @@ func handlePostDeliveryEvent(w http.ResponseWriter, r *http.Request) {
 	err = storage.StoreEvent(event, platformToken, "valid")
 	if err != nil {
 		logger.Error("failed to store event", map[string]interface{}{
-			"error": err.Error(),
+			"error":    err.Error(),
 			"order_id": event.OrderID,
 		})
 		w.WriteHeader(http.StatusInternalServerError)
@@ -114,7 +114,7 @@ func handlePostDeliveryEventsBatch(w http.ResponseWriter, r *http.Request) {
 	// Limit batch size for performance and memory protection
 	if len(events) > 1000 {
 		logger.Warn("batch size too large", map[string]interface{}{
-			"batch_size": len(events),
+			"batch_size":  len(events),
 			"max_allowed": 1000,
 		})
 		http.Error(w, "batch size exceeds maximum of 1000 events", http.StatusBadRequest)
@@ -155,7 +155,7 @@ func handlePostDeliveryEventsBatch(w http.ResponseWriter, r *http.Request) {
 	err = storage.StoreEventsBatch(events, platformToken, "valid")
 	if err != nil {
 		logger.Error("failed to store batch events", map[string]interface{}{
-			"error": err.Error(),
+			"error":      err.Error(),
 			"batch_size": len(events),
 		})
 		w.WriteHeader(http.StatusInternalServerError)
@@ -163,14 +163,14 @@ func handlePostDeliveryEventsBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger.Info("batch events stored successfully", map[string]interface{}{
-		"batch_size": len(events),
+		"batch_size":     len(events),
 		"platform_token": platformToken,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok",
+		"status":           "ok",
 		"events_processed": len(events),
 	})
 }
