@@ -10,18 +10,20 @@ import (
 
 	"ingestion-service/internal/models"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"golang.org/x/sync/errgroup"
 )
 
 var DB *sql.DB
 
-// Global Connection Pool
+// Global Connection Pool & Tuning Constants
 const (
-	MaxConns    = 100
-	IdleConns   = 100
-	MaxBatch    = 256
-	FlushInter  = 20 * time.Millisecond
+	MaxConns       = 100
+	IdleConns      = 100
+	BatchSize      = 512              // Increased batch size for COPY
+	FlushInterval  = 15 * time.Millisecond
+	WorkerCount    = 32               // Parallel writers
+	ChannelSize    = 500000           // Half a million events buffer
 )
 
 type eventEntry struct {
@@ -38,86 +40,78 @@ type eventEntry struct {
 	Status         string
 }
 
-// sync.Pools for zero-allocation batching
-var (
-	eventPool = sync.Pool{New: func() interface{} { return &eventEntry{} }}
-	batchPool = sync.Pool{New: func() interface{} { 
-		b := make([]eventEntry, 0, MaxBatch)
-		return &b 
-	}}
-	argsPool = sync.Pool{New: func() interface{} { 
-		a := make([]interface{}, 0, MaxBatch*12)
-		return &a 
-	}}
-)
+// sync.Pool for zero-allocation entries
+var eventPool = sync.Pool{
+	New: func() interface{} {
+		return &eventEntry{}
+	},
+}
 
-// Channel for buffering events - large enough to handle bursts
-var eventChan = make(chan eventEntry, 200000)
+// Channel for ultra-fast ingestion
+var eventChan = make(chan *eventEntry, ChannelSize)
 
-// QueueEvent - non-blocking ingestion
+// QueueEvent - Non-blocking, zero-allocation entry path
 func QueueEvent(event models.DeliveryEvent, token, status string) {
+	e := eventPool.Get().(*eventEntry)
+	e.OrderID = event.OrderID
+	e.EventType = event.EventType
+	e.EventTimestamp = event.EventTimestamp.Unix()
+	e.ReceivedAt = time.Now().Unix()
+	e.CustomerID = event.CustomerID
+	e.RestaurantID = event.RestaurantID
+	e.DriverID = event.DriverID
+	e.Lat = event.Location.Lat
+	e.Lng = event.Location.Lng
+	e.Token = token
+	e.Status = status
+
 	select {
-	case eventChan <- eventEntry{
-		OrderID:        event.OrderID,
-		EventType:      event.EventType,
-		EventTimestamp: event.EventTimestamp.Unix(),
-		ReceivedAt:     time.Now().Unix(),
-		CustomerID:     event.CustomerID,
-		RestaurantID:   event.RestaurantID,
-		DriverID:       event.DriverID,
-		Lat:            event.Location.Lat,
-		Lng:            event.Location.Lng,
-		Token:          token,
-		Status:         status,
-	}:
+	case eventChan <- e:
 	default:
-		// Drop events if channel is full to protect latency
+		// Drop to protect latency if buffer is saturated
+		eventPool.Put(e)
 	}
 }
 
-// StartWriters - uses errgroup to manage parallel background writers
-func StartWriters(ctx context.Context, g *errgroup.Group, n int) {
-	for i := 0; i < n; i++ {
+// StartWriters - Uses PostgreSQL COPY protocol for maximum throughput
+func StartWriters(ctx context.Context, g *errgroup.Group) {
+	for i := 0; i < WorkerCount; i++ {
 		g.Go(func() error {
-			return writerLoop(ctx)
+			return copyWorker(ctx)
 		})
 	}
 }
 
-func writerLoop(ctx context.Context) error {
-	batchPtr := batchPool.Get().(*[]eventEntry)
-	batch := (*batchPtr)[:0]
-	defer batchPool.Put(batchPtr)
-
-	ticker := time.NewTicker(FlushInter)
+// copyWorker uses the PostgreSQL COPY command (fastest possible ingestion)
+func copyWorker(ctx context.Context) error {
+	batch := make([]*eventEntry, 0, BatchSize)
+	ticker := time.NewTicker(FlushInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			if len(batch) > 0 {
-				flushBatch(batch)
+				flushCopy(batch)
 			}
 			return ctx.Err()
 		case e := <-eventChan:
 			batch = append(batch, e)
-			if len(batch) >= MaxBatch {
-				flushBatch(batch)
+			if len(batch) >= BatchSize {
+				flushCopy(batch)
 				batch = batch[:0]
 			}
 		case <-ticker.C:
 			if len(batch) > 0 {
-				flushBatch(batch)
+				flushCopy(batch)
 				batch = batch[:0]
 			}
 		}
 	}
 }
 
-// Pre-allocated query fragments
-const insertQueryPrefix = `INSERT INTO events (order_id, event_type, event_timestamp, received_at, customer_id, restaurant_id, driver_id, location_lat, location_lng, platform_token, validation_status, validation_error) VALUES `
-
-func flushBatch(events []eventEntry) {
+// flushCopy implements the PostgreSQL COPY protocol - No placeholders, no SQL injection
+func flushCopy(events []*eventEntry) {
 	if len(events) == 0 || DB == nil {
 		return
 	}
@@ -125,90 +119,104 @@ func flushBatch(events []eventEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	argsPtr := argsPool.Get().(*[]interface{})
-	args := (*argsPtr)[:0]
-	defer argsPool.Put(argsPtr)
+	// Start transaction for COPY
+	tx, err := DB.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
 
-	var sb strings.Builder
-	sb.Grow(len(insertQueryPrefix) + len(events)*120)
-	sb.WriteString(insertQueryPrefix)
+	// Use COPY protocol - No string concatenation or placeholders
+	stmt, err := tx.Prepare(pq.CopyIn("events",
+		"order_id", "event_type", "event_timestamp", "received_at",
+		"customer_id", "restaurant_id", "driver_id", "location_lat", "location_lng",
+		"platform_token", "validation_status", "validation_error"))
+	if err != nil {
+		return
+	}
 
-	for i, e := range events {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		offset := i * 12
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			offset+1, offset+2, offset+3, offset+4, offset+5, offset+6,
-			offset+7, offset+8, offset+9, offset+10, offset+11, offset+12)
-		
-		args = append(args, e.OrderID, e.EventType, e.EventTimestamp, e.ReceivedAt,
+	for _, e := range events {
+		_, err = stmt.Exec(
+			e.OrderID, e.EventType, e.EventTimestamp, e.ReceivedAt,
 			e.CustomerID, e.RestaurantID, e.DriverID, e.Lat, e.Lng,
-			e.Token, e.Status, "")
+			e.Token, e.Status, "",
+		)
+		if err != nil {
+			stmt.Close()
+			return
+		}
 	}
 
-	_, _ = DB.ExecContext(ctx, sb.String(), args...)
-}
-
-// Compatibility layer
-func StoreEvent(event models.DeliveryEvent, token, status string) error {
-	QueueEvent(event, token, status)
-	return nil
-}
-
-func StoreEventsBatch(events []models.DeliveryEvent, token, status string) error {
-	for i := range events {
-		QueueEvent(events[i], token, status)
+	err = stmt.Close()
+	if err != nil {
+		return
 	}
-	return nil
+
+	err = tx.Commit()
+	if err != nil {
+		return
+	}
+
+	// Return objects to pool
+	for _, e := range events {
+		eventPool.Put(e)
+	}
 }
 
+// QueryEvents - Secure whitelisted filtering
 func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEvent, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	query := `SELECT id, order_id, event_type, event_timestamp, received_at, customer_id, restaurant_id, driver_id, location_lat, location_lng, platform_token, validation_status, COALESCE(validation_error, '') FROM events`
-	
-	var args []interface{}
-	var conds []string
-	n := 1
-
-	// Whitelist of allowed filter keys to prevent SQL injection
-	allowedFilters := map[string]struct{}{
-		"order_id":      {},
-		"event_type":    {},
-		"customer_id":   {},
-		"restaurant_id": {},
-		"driver_id":     {},
+	// Columns whitelisting to prevent SQL injection in column names
+	allowedFilters := map[string]string{
+		"order_id":      "order_id",
+		"event_type":    "event_type",
+		"customer_id":   "customer_id",
+		"restaurant_id": "restaurant_id",
+		"driver_id":     "driver_id",
 	}
 
+	var sb strings.Builder
+	sb.WriteString("SELECT id, order_id, event_type, event_timestamp, received_at, customer_id, restaurant_id, driver_id, location_lat, location_lng, platform_token, validation_status, COALESCE(validation_error, '') FROM events")
+
+	args := make([]interface{}, 0, len(filters)+1)
+	conds := make([]string, 0, len(filters))
+	n := 1
+
 	for k, v := range filters {
-		if _, allowed := allowedFilters[k]; !allowed {
-			continue // Skip unallowed filter keys
+		col, ok := allowedFilters[k]
+		if !ok {
+			continue // Skip unallowed or suspicious filters
 		}
 		if s, ok := v.(string); ok && s != "" {
-			conds = append(conds, fmt.Sprintf("%s=$%d", k, n))
+			conds = append(conds, fmt.Sprintf("%s=$%d", col, n))
 			args = append(args, s)
 			n++
 		}
 	}
 
 	if len(conds) > 0 {
-		query += " WHERE " + strings.Join(conds, " AND ")
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(conds, " AND "))
 	}
-	query += fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", n)
+	
+	fmt.Fprintf(&sb, " ORDER BY id DESC LIMIT $%d", n)
 	args = append(args, limit)
 
-	rows, err := DB.QueryContext(ctx, query, args...)
+	rows, err := DB.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var results []models.StoredEvent
+	results := make([]models.StoredEvent, 0, limit)
 	for rows.Next() {
 		var e models.StoredEvent
-		if err := rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt, &e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng, &e.PlatformToken, &e.ValidationStatus, &e.ValidationError); err == nil {
+		err := rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt,
+			&e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng,
+			&e.PlatformToken, &e.ValidationStatus, &e.ValidationError)
+		if err == nil {
 			results = append(results, e)
 		}
 	}
@@ -221,12 +229,12 @@ func InitDatabase(url string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	DB.SetMaxOpenConns(MaxConns)
 	DB.SetMaxIdleConns(IdleConns)
 	DB.SetConnMaxLifetime(5 * time.Minute)
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return DB.PingContext(ctx)
 }
@@ -235,4 +243,17 @@ func Close() {
 	if DB != nil {
 		DB.Close()
 	}
+}
+
+// StoreEvent & StoreEventsBatch - Kept for compatibility
+func StoreEvent(event models.DeliveryEvent, token, status string) error {
+	QueueEvent(event, token, status)
+	return nil
+}
+
+func StoreEventsBatch(events []models.DeliveryEvent, token, status string) error {
+	for i := range events {
+		QueueEvent(events[i], token, status)
+	}
+	return nil
 }

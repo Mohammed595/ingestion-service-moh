@@ -72,8 +72,8 @@ func main() {
 	// Background refresh
 	validation.StartBackgroundRefresh()
 
-	// Parallel writers (32 parallel DB writers for maximum RPS)
-	storage.StartWriters(ctx, g, 32)
+	// Parallel writers (Uses PostgreSQL COPY for maximum throughput)
+	storage.StartWriters(ctx, g)
 
 	// 5. Optimized server setup
 	mux := http.NewServeMux()
