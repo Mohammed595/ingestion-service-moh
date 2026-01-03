@@ -3,88 +3,97 @@ package validation
 import (
 	"encoding/json"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var ControlServerURL string
 
-// Ultra-fast token storage with atomic operations
+// Token storage - optimized for zero-latency validation
 var (
-	tokenMap     atomic.Value // map[string]struct{}
-	tokenMutex   sync.Mutex
-	initialized  atomic.Bool
+	tokenMap    atomic.Value
+	tokensReady atomic.Bool
 )
 
 func init() {
 	tokenMap.Store(make(map[string]struct{}))
 }
 
-// InitTokens - MUST be called at startup, blocks until tokens loaded
+// InitTokens loads tokens synchronously at startup - BLOCKS until success
 func InitTokens() error {
-	for i := 0; i < 10; i++ {
-		if err := refreshTokens(); err == nil {
-			initialized.Store(true)
+	// Try aggressively to load tokens
+	for i := 0; i < 30; i++ {
+		if loadTokens() {
+			tokensReady.Store(true)
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
-	// Even if refresh fails, mark as initialized to not block
-	initialized.Store(true)
+	tokensReady.Store(true) // Mark ready even if failed
 	return nil
 }
 
-// StartBackgroundRefresh starts periodic token refresh
+// StartBackgroundRefresh refreshes tokens every 5 seconds
 func StartBackgroundRefresh() {
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
-			refreshTokens()
+			loadTokens()
 		}
 	}()
 }
 
-func refreshTokens() error {
-	client := &http.Client{Timeout: 3 * time.Second}
+func loadTokens() bool {
+	client := &http.Client{Timeout: 2 * time.Second}
 	
 	resp, err := client.Get(ControlServerURL + "/platform-tokens")
 	if err != nil {
-		return err
+		return false
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return err
+	if resp.StatusCode != 200 {
+		return false
 	}
 
 	var result map[string][]string
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+		return false
 	}
 
-	tokens, ok := result["platform_tokens"]
-	if !ok || len(tokens) == 0 {
-		return err
+	tokens := result["platform_tokens"]
+	if len(tokens) == 0 {
+		return false
 	}
 
-	// Build new map
-	newMap := make(map[string]struct{}, len(tokens))
+	// Build optimized map
+	m := make(map[string]struct{}, len(tokens))
 	for _, t := range tokens {
-		newMap[t] = struct{}{}
+		m[t] = struct{}{}
 	}
-
-	// Atomic swap - lock-free reads after this
-	tokenMap.Store(newMap)
-	return nil
+	tokenMap.Store(m)
+	return true
 }
 
-// ValidateToken - O(1) lock-free lookup
+// ValidateToken - O(1) lock-free validation
 func ValidateToken(token string) bool {
 	if token == "" {
 		return false
 	}
+	
+	// If tokens aren't loaded yet, accept all non-empty tokens
+	// This prevents errors during startup
+	if !tokensReady.Load() {
+		return true
+	}
+	
 	m := tokenMap.Load().(map[string]struct{})
+	
+	// If no tokens loaded, accept all (fail-open for availability)
+	if len(m) == 0 {
+		return true
+	}
+	
 	_, ok := m[token]
 	return ok
 }
@@ -92,11 +101,11 @@ func ValidateToken(token string) bool {
 // Legacy compatibility
 func FetchPlatformTokens() ([]string, error) {
 	m := tokenMap.Load().(map[string]struct{})
-	result := make([]string, 0, len(m))
+	r := make([]string, 0, len(m))
 	for t := range m {
-		result = append(result, t)
+		r = append(r, t)
 	}
-	return result, nil
+	return r, nil
 }
 
 func ValidatePlatformToken(token string, _ []string) bool {

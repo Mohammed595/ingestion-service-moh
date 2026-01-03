@@ -22,7 +22,7 @@ var (
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
-			Help: "Total number of HTTP requests",
+			Help: "Total HTTP requests",
 		},
 		[]string{"handler", "method", "status"},
 	)
@@ -30,16 +30,15 @@ var (
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "HTTP request duration in seconds",
-			Buckets: []float64{.0005, .001, .005, .01, .025, .05, .1, .5, 1},
+			Help:    "HTTP request duration",
+			Buckets: []float64{.0001, .0005, .001, .005, .01, .05, .1, .5, 1},
 		},
 		[]string{"handler", "method"},
 	)
 )
 
 func init() {
-	prometheus.MustRegister(httpRequestsTotal)
-	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(httpRequestsTotal, httpRequestDuration)
 }
 
 func main() {
@@ -48,34 +47,36 @@ func main() {
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
 
-	// 1. Init database FIRST
+	// 1. Initialize database
+	logger.Info("connecting to database", nil)
 	if err := storage.InitDatabase(dbURL); err != nil {
-		logger.Fatal("db init failed", map[string]interface{}{"error": err.Error()})
+		logger.Fatal("db error", map[string]interface{}{"error": err.Error()})
 	}
 	defer storage.Close()
+	logger.Info("database connected", nil)
 
-	// 2. Load tokens SYNCHRONOUSLY (blocks until ready)
-	logger.Info("loading tokens...", nil)
-	if err := validation.InitTokens(); err != nil {
-		logger.Warn("token init warning", map[string]interface{}{"error": err.Error()})
-	}
-	logger.Info("tokens loaded", nil)
+	// 2. Load tokens BEFORE accepting traffic
+	logger.Info("loading tokens", nil)
+	validation.InitTokens()
+	logger.Info("tokens ready", nil)
 
-	// 3. Start background systems
+	// 3. Start background workers
 	validation.StartBackgroundRefresh()
-	storage.StartWriters(4) // 4 parallel DB writers
+	storage.StartWriters(8) // 8 parallel DB writers
 
 	// 4. Routes
 	http.HandleFunc("/delivery-events", instrument("events", handlers.DeliveryEventsHandler))
 	http.HandleFunc("/health", instrument("health", handlers.HealthHandler))
 	http.Handle("/metrics", promhttp.Handler())
 
-	// 5. Server with optimized settings
+	// 5. High-performance server
 	server := &http.Server{
-		Addr:         ":" + port,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
-		IdleTimeout:  30 * time.Second,
+		Addr:              ":" + port,
+		ReadTimeout:       3 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      3 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    1 << 16, // 64KB
 	}
 
 	logger.Info("server starting", map[string]interface{}{"port": port})
@@ -94,12 +95,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
+	logger.Info("shutdown complete", nil)
 }
 
 func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rw := &respWriter{ResponseWriter: w, status: 200}
+		rw := &statusWriter{ResponseWriter: w, status: 200}
 		
 		h(rw, r)
 		
@@ -109,19 +111,19 @@ func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-type respWriter struct {
+type statusWriter struct {
 	http.ResponseWriter
 	status int
 }
 
-func (w *respWriter) WriteHeader(code int) {
+func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func getEnv(k, def string) string {
+func getEnv(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
-	return def
+	return d
 }
