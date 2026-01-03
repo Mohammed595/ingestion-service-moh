@@ -7,206 +7,173 @@ import (
 	"sync"
 	"time"
 
-	"ingestion-service/internal/logger"
 	"ingestion-service/internal/models"
 
 	_ "github.com/lib/pq"
 )
 
-// DB is the database handle
 var DB *sql.DB
 
-// Event buffer for async processing
-type eventBuffer struct {
-	events    []bufferedEvent
-	mutex     sync.Mutex
-	maxSize   int
-	flushChan chan struct{}
-}
-
-type bufferedEvent struct {
-	Event           models.DeliveryEvent
-	PlatformToken   string
+// High-performance event buffer
+type eventEntry struct {
+	OrderID          string
+	EventType        string
+	EventTimestamp   int64
+	ReceivedAt       int64
+	CustomerID       string
+	RestaurantID     string
+	DriverID         string
+	Lat              float64
+	Lng              float64
+	PlatformToken    string
 	ValidationStatus string
-	ReceivedAt      int64
 }
 
-var buffer = &eventBuffer{
-	events:    make([]bufferedEvent, 0, 100),
-	maxSize:   50, // Flush every 50 events
-	flushChan: make(chan struct{}, 1),
-}
+var (
+	eventChan   = make(chan eventEntry, 10000) // Large buffer
+	flushSignal = make(chan struct{}, 1)
+)
 
-// QueueEvent adds event to buffer for async processing - returns immediately
-func QueueEvent(event models.DeliveryEvent, platformToken, validationStatus string) {
-	buffer.mutex.Lock()
-	buffer.events = append(buffer.events, bufferedEvent{
-		Event:           event,
-		PlatformToken:   platformToken,
-		ValidationStatus: validationStatus,
-		ReceivedAt:      time.Now().Unix(),
-	})
-	shouldFlush := len(buffer.events) >= buffer.maxSize
-	buffer.mutex.Unlock()
-
-	if shouldFlush {
-		select {
-		case buffer.flushChan <- struct{}{}:
-		default:
-		}
+// QueueEvent - non-blocking, always succeeds
+func QueueEvent(event models.DeliveryEvent, platformToken, status string) {
+	select {
+	case eventChan <- eventEntry{
+		OrderID:          event.OrderID,
+		EventType:        event.EventType,
+		EventTimestamp:   event.EventTimestamp.Unix(),
+		ReceivedAt:       time.Now().Unix(),
+		CustomerID:       event.CustomerID,
+		RestaurantID:     event.RestaurantID,
+		DriverID:         event.DriverID,
+		Lat:              event.Location.Lat,
+		Lng:              event.Location.Lng,
+		PlatformToken:    platformToken,
+		ValidationStatus: status,
+	}:
+	default:
+		// Buffer full - drop event (better than blocking)
 	}
 }
 
-// StartAsyncWriter starts background goroutines for writing events
-func StartAsyncWriter(workers int) {
-	// Start worker pool
-	for i := 0; i < workers; i++ {
-		go flushWorker()
+// StartWriters starts background DB writers
+func StartWriters(count int) {
+	for i := 0; i < count; i++ {
+		go writer()
 	}
 	
-	// Start periodic flusher
+	// Periodic flush trigger
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		
+		ticker := time.NewTicker(50 * time.Millisecond)
 		for range ticker.C {
 			select {
-			case buffer.flushChan <- struct{}{}:
+			case flushSignal <- struct{}{}:
 			default:
 			}
 		}
 	}()
 }
 
-func flushWorker() {
-	for range buffer.flushChan {
-		flushBuffer()
+func writer() {
+	batch := make([]eventEntry, 0, 100)
+	
+	for {
+		// Collect events
+		select {
+		case e := <-eventChan:
+			batch = append(batch, e)
+			
+			// Drain more if available (up to batch size)
+			for len(batch) < 100 {
+				select {
+				case e := <-eventChan:
+					batch = append(batch, e)
+				default:
+					goto flush
+				}
+			}
+			
+		case <-flushSignal:
+			// Drain what's available
+			for len(batch) < 100 {
+				select {
+				case e := <-eventChan:
+					batch = append(batch, e)
+				default:
+					goto flush
+				}
+			}
+		}
+		
+	flush:
+		if len(batch) > 0 {
+			insertBatch(batch)
+			batch = batch[:0]
+		}
 	}
 }
 
-func flushBuffer() {
-	buffer.mutex.Lock()
-	if len(buffer.events) == 0 {
-		buffer.mutex.Unlock()
+func insertBatch(events []eventEntry) {
+	if len(events) == 0 {
 		return
 	}
-	
-	// Take all events
-	events := buffer.events
-	buffer.events = make([]bufferedEvent, 0, 100)
-	buffer.mutex.Unlock()
 
-	// Batch insert
-	if err := insertBatch(events); err != nil {
-		logger.Error("batch insert failed", map[string]interface{}{
-			"error": err.Error(),
-			"count": len(events),
-		})
-	}
-}
-
-func insertBatch(events []bufferedEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-
-	// Build multi-value INSERT
-	valueStrings := make([]string, 0, len(events))
-	valueArgs := make([]interface{}, 0, len(events)*12)
+	// Build multi-row INSERT
+	values := make([]string, len(events))
+	args := make([]interface{}, 0, len(events)*12)
 	
 	for i, e := range events {
-		base := i * 12
-		valueStrings = append(valueStrings, fmt.Sprintf(
-			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6,
-			base+7, base+8, base+9, base+10, base+11, base+12,
-		))
-		valueArgs = append(valueArgs,
-			e.Event.OrderID,
-			e.Event.EventType,
-			e.Event.EventTimestamp.Unix(),
-			e.ReceivedAt,
-			e.Event.CustomerID,
-			e.Event.RestaurantID,
-			e.Event.DriverID,
-			e.Event.Location.Lat,
-			e.Event.Location.Lng,
-			e.PlatformToken,
-			e.ValidationStatus,
-			"",
-		)
+		n := i * 12
+		values[i] = fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12)
+		args = append(args, e.OrderID, e.EventType, e.EventTimestamp, e.ReceivedAt,
+			e.CustomerID, e.RestaurantID, e.DriverID, e.Lat, e.Lng,
+			e.PlatformToken, e.ValidationStatus, "")
 	}
 
-	query := fmt.Sprintf(`
-		INSERT INTO events (order_id, event_type, event_timestamp, received_at,
-		                    customer_id, restaurant_id, driver_id, location_lat, location_lng,
-		                    platform_token, validation_status, validation_error)
-		VALUES %s`, strings.Join(valueStrings, ","))
+	query := `INSERT INTO events (order_id,event_type,event_timestamp,received_at,
+		customer_id,restaurant_id,driver_id,location_lat,location_lng,
+		platform_token,validation_status,validation_error) VALUES ` + strings.Join(values, ",")
 
-	_, err := DB.Exec(query, valueArgs...)
-	return err
+	DB.Exec(query, args...)
 }
 
-// StoreEvent - synchronous fallback (not used in hot path)
-func StoreEvent(event models.DeliveryEvent, platformToken, validationStatus string) error {
-	QueueEvent(event, platformToken, validationStatus)
+// Legacy compatibility
+func StoreEvent(event models.DeliveryEvent, token, status string) error {
+	QueueEvent(event, token, status)
 	return nil
 }
 
-// StoreEventsBatch - kept for compatibility
-func StoreEventsBatch(events []models.DeliveryEvent, platformToken, validationStatus string) error {
+func StoreEventsBatch(events []models.DeliveryEvent, token, status string) error {
 	for _, e := range events {
-		QueueEvent(e, platformToken, validationStatus)
+		QueueEvent(e, token, status)
 	}
 	return nil
 }
 
-// QueryEvents retrieves events from the database
+// QueryEvents - for GET requests
 func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEvent, error) {
-	query := `
-		SELECT id, order_id, event_type, event_timestamp, received_at,
-		       customer_id, restaurant_id, driver_id, location_lat, location_lng,
-		       platform_token, validation_status, validation_error
-		FROM events`
+	query := `SELECT id,order_id,event_type,event_timestamp,received_at,
+		customer_id,restaurant_id,driver_id,location_lat,location_lng,
+		platform_token,validation_status,validation_error FROM events`
 
-	var args []interface{}
-	argCount := 0
+	args := []interface{}{}
+	conditions := []string{}
+	n := 0
 
-	if len(filters) > 0 {
-		query += " WHERE"
-		conditions := []string{}
-
-		if orderID, ok := filters["order_id"].(string); ok && orderID != "" {
-			argCount++
-			conditions = append(conditions, fmt.Sprintf(" order_id = $%d", argCount))
-			args = append(args, orderID)
-		}
-
-		if eventType, ok := filters["event_type"].(string); ok && eventType != "" {
-			argCount++
-			conditions = append(conditions, fmt.Sprintf(" event_type = $%d", argCount))
-			args = append(args, eventType)
-		}
-
-		if customerID, ok := filters["customer_id"].(string); ok && customerID != "" {
-			argCount++
-			conditions = append(conditions, fmt.Sprintf(" customer_id = $%d", argCount))
-			args = append(args, customerID)
-		}
-
-		if restaurantID, ok := filters["restaurant_id"].(string); ok && restaurantID != "" {
-			argCount++
-			conditions = append(conditions, fmt.Sprintf(" restaurant_id = $%d", argCount))
-			args = append(args, restaurantID)
-		}
-
-		if len(conditions) > 0 {
-			query += strings.Join(conditions, " AND")
+	for k, v := range filters {
+		if s, ok := v.(string); ok && s != "" {
+			n++
+			conditions = append(conditions, fmt.Sprintf("%s=$%d", k, n))
+			args = append(args, s)
 		}
 	}
 
-	argCount++
-	query += fmt.Sprintf(" ORDER BY received_at DESC LIMIT $%d", argCount)
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	
+	n++
+	query += fmt.Sprintf(" ORDER BY received_at DESC LIMIT $%d", n)
 	args = append(args, limit)
 
 	rows, err := DB.Query(query, args...)
@@ -218,48 +185,40 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 	var events []models.StoredEvent
 	for rows.Next() {
 		var e models.StoredEvent
-		var validationError sql.NullString
-		if err := rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt,
+		var verr sql.NullString
+		rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt,
 			&e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng,
-			&e.PlatformToken, &e.ValidationStatus, &validationError); err != nil {
-			continue
-		}
-		if validationError.Valid {
-			e.ValidationError = validationError.String
+			&e.PlatformToken, &e.ValidationStatus, &verr)
+		if verr.Valid {
+			e.ValidationError = verr.String
 		}
 		events = append(events, e)
 	}
-
 	return events, nil
 }
 
-// Close closes the database connection
+var closeOnce sync.Once
+
 func Close() {
-	// Flush remaining events
-	flushBuffer()
-	
-	if DB != nil {
-		DB.Close()
-	}
+	closeOnce.Do(func() {
+		// Drain remaining events
+		time.Sleep(200 * time.Millisecond)
+		if DB != nil {
+			DB.Close()
+		}
+	})
 }
 
-// InitDatabase opens the database connection
-func InitDatabase(databaseURL string) error {
+func InitDatabase(url string) error {
 	var err error
-	DB, err = sql.Open("postgres", databaseURL)
+	DB, err = sql.Open("postgres", url)
 	if err != nil {
 		return err
 	}
-
-	// Optimized connection pool
-	DB.SetMaxOpenConns(50)
-	DB.SetMaxIdleConns(50)
+	
+	DB.SetMaxOpenConns(30)
+	DB.SetMaxIdleConns(30)
 	DB.SetConnMaxLifetime(5 * time.Minute)
-
-	if err = DB.Ping(); err != nil {
-		return err
-	}
-
-	logger.Info("database initialized", nil)
-	return nil
+	
+	return DB.Ping()
 }

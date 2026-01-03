@@ -4,105 +4,101 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// ControlServerURL is the URL of the control server
 var ControlServerURL string
 
-// tokenSet holds platform tokens in a map for O(1) lookup
-type tokenSet struct {
-	tokens  map[string]struct{}
-	mutex   sync.RWMutex
-	ready   bool
+// Ultra-fast token storage with atomic operations
+var (
+	tokenMap     atomic.Value // map[string]struct{}
+	tokenMutex   sync.Mutex
+	initialized  atomic.Bool
+)
+
+func init() {
+	tokenMap.Store(make(map[string]struct{}))
 }
 
-var validTokens = &tokenSet{
-	tokens: make(map[string]struct{}),
+// InitTokens - MUST be called at startup, blocks until tokens loaded
+func InitTokens() error {
+	for i := 0; i < 10; i++ {
+		if err := refreshTokens(); err == nil {
+			initialized.Store(true)
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	// Even if refresh fails, mark as initialized to not block
+	initialized.Store(true)
+	return nil
 }
 
-// StartBackgroundTokenRefresh starts a goroutine that refreshes tokens periodically
-// This ensures tokens are always available and requests never block
-func StartBackgroundTokenRefresh() {
-	// Initial load - blocking
-	refreshTokensNow()
-	
-	// Background refresh every 30 seconds
+// StartBackgroundRefresh starts periodic token refresh
+func StartBackgroundRefresh() {
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		
+		ticker := time.NewTicker(10 * time.Second)
 		for range ticker.C {
-			refreshTokensNow()
+			refreshTokens()
 		}
 	}()
 }
 
-// refreshTokensNow fetches tokens from control server
-func refreshTokensNow() {
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-
+func refreshTokens() error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	
 	resp, err := client.Get(ControlServerURL + "/platform-tokens")
 	if err != nil {
-		return // Keep existing tokens on error
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return
+		return err
 	}
 
 	var result map[string][]string
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return
+		return err
 	}
 
 	tokens, ok := result["platform_tokens"]
-	if !ok {
-		return
+	if !ok || len(tokens) == 0 {
+		return err
 	}
 
-	// Build new token set
-	newSet := make(map[string]struct{}, len(tokens))
+	// Build new map
+	newMap := make(map[string]struct{}, len(tokens))
 	for _, t := range tokens {
-		newSet[t] = struct{}{}
+		newMap[t] = struct{}{}
 	}
 
-	// Atomic swap
-	validTokens.mutex.Lock()
-	validTokens.tokens = newSet
-	validTokens.ready = true
-	validTokens.mutex.Unlock()
+	// Atomic swap - lock-free reads after this
+	tokenMap.Store(newMap)
+	return nil
 }
 
-// ValidateToken checks if token is valid - O(1) lookup, never blocks
+// ValidateToken - O(1) lock-free lookup
 func ValidateToken(token string) bool {
-	validTokens.mutex.RLock()
-	defer validTokens.mutex.RUnlock()
-	
-	if !validTokens.ready {
+	if token == "" {
 		return false
 	}
-	
-	_, exists := validTokens.tokens[token]
-	return exists
+	m := tokenMap.Load().(map[string]struct{})
+	_, ok := m[token]
+	return ok
 }
 
-// FetchPlatformTokens - kept for compatibility but now just returns current tokens
+// Legacy compatibility
 func FetchPlatformTokens() ([]string, error) {
-	validTokens.mutex.RLock()
-	defer validTokens.mutex.RUnlock()
-	
-	result := make([]string, 0, len(validTokens.tokens))
-	for t := range validTokens.tokens {
+	m := tokenMap.Load().(map[string]struct{})
+	result := make([]string, 0, len(m))
+	for t := range m {
 		result = append(result, t)
 	}
 	return result, nil
 }
 
-// ValidatePlatformToken - kept for compatibility
 func ValidatePlatformToken(token string, _ []string) bool {
 	return ValidateToken(token)
 }

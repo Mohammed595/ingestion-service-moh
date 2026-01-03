@@ -5,105 +5,76 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"ingestion-service/internal/models"
 	"ingestion-service/internal/storage"
 	"ingestion-service/internal/validation"
 )
 
-// Pre-allocated response bytes for zero-allocation responses
-var (
-	okResponse     = []byte(`{"status":"ok"}`)
-	okResponseLen  = len(okResponse)
-	
-	// Reusable byte pools
-	bodyPool = sync.Pool{
-		New: func() interface{} {
-			b := make([]byte, 0, 4096)
-			return &b
-		},
-	}
-)
+// Pre-allocated responses (zero allocation in hot path)
+var okResp = []byte(`{"status":"ok"}`)
+var healthResp = []byte(`{"status":"healthy"}`)
 
-// DeliveryEventsHandler - ultra-fast event ingestion
+// DeliveryEventsHandler - main entry point
 func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodPost:
-		handlePostDeliveryEvent(w, r)
-	case http.MethodGet:
-		handleGetDeliveryEvents(w, r)
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if r.Method == http.MethodPost {
+		handlePost(w, r)
+	} else if r.Method == http.MethodGet {
+		handleGet(w, r)
+	} else {
+		w.WriteHeader(405)
 	}
 }
 
-// handlePostDeliveryEvent - optimized for minimum latency
-func handlePostDeliveryEvent(w http.ResponseWriter, r *http.Request) {
-	// Quick token validation first - O(1) lookup, no network call
-	platformToken := r.Header.Get("X-Platform-Token")
-	if !validation.ValidateToken(platformToken) {
-		w.WriteHeader(http.StatusForbidden)
+// handlePost - ultra-optimized POST handler
+func handlePost(w http.ResponseWriter, r *http.Request) {
+	// 1. Validate token FIRST (fastest check, no I/O)
+	token := r.Header.Get("X-Platform-Token")
+	if !validation.ValidateToken(token) {
+		w.WriteHeader(403)
 		return
 	}
 
-	// Read body using pooled buffer
-	bufPtr := bodyPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0]
-	defer func() {
-		*bufPtr = buf[:0]
-		bodyPool.Put(bufPtr)
-	}()
-
+	// 2. Read body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(400)
 		return
 	}
 
-	// Parse event
+	// 3. Parse JSON
 	var event models.DeliveryEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(400)
 		return
 	}
 
-	// Queue event for async processing - returns immediately
-	storage.QueueEvent(event, platformToken, "valid")
+	// 4. Queue for async write (non-blocking)
+	storage.QueueEvent(event, token, "valid")
 
-	// Send pre-allocated response
+	// 5. Immediate response
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(okResponse)
+	w.WriteHeader(200)
+	w.Write(okResp)
 }
 
-// handleGetDeliveryEvents returns stored events
-func handleGetDeliveryEvents(w http.ResponseWriter, r *http.Request) {
-	limitStr := r.URL.Query().Get("limit")
+// handleGet - query events
+func handleGet(w http.ResponseWriter, r *http.Request) {
 	limit := 100
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
-			limit = l
-		}
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
 	}
 
-	filters := make(map[string]interface{})
-	if v := r.URL.Query().Get("order_id"); v != "" {
-		filters["order_id"] = v
-	}
-	if v := r.URL.Query().Get("event_type"); v != "" {
-		filters["event_type"] = v
-	}
-	if v := r.URL.Query().Get("customer_id"); v != "" {
-		filters["customer_id"] = v
-	}
-	if v := r.URL.Query().Get("restaurant_id"); v != "" {
-		filters["restaurant_id"] = v
+	filters := map[string]interface{}{}
+	for _, k := range []string{"order_id", "event_type", "customer_id", "restaurant_id"} {
+		if v := r.URL.Query().Get(k); v != "" {
+			filters[k] = v
+		}
 	}
 
 	events, err := storage.QueryEvents(limit, filters)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(500)
 		return
 	}
 
@@ -111,9 +82,9 @@ func handleGetDeliveryEvents(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(events)
 }
 
-// HealthHandler returns service health
+// HealthHandler - health check
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"healthy"}`))
+	w.WriteHeader(200)
+	w.Write(healthResp)
 }

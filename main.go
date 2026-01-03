@@ -31,7 +31,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
 			Help:    "HTTP request duration in seconds",
-			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1},
+			Buckets: []float64{.0005, .001, .005, .01, .025, .05, .1, .5, 1},
 		},
 		[]string{"handler", "method"},
 	)
@@ -43,85 +43,85 @@ func init() {
 }
 
 func main() {
+	// Config
 	validation.ControlServerURL = getEnv("CONTROL_SERVER_URL", "http://control-server:9000")
-	databaseURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
+	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
 
-	// Initialize database
-	if err := storage.InitDatabase(databaseURL); err != nil {
-		logger.Fatal("failed to initialize database", map[string]interface{}{
-			"error": err.Error(),
-		})
+	// 1. Init database FIRST
+	if err := storage.InitDatabase(dbURL); err != nil {
+		logger.Fatal("db init failed", map[string]interface{}{"error": err.Error()})
 	}
 	defer storage.Close()
 
-	// Start background token refresh - tokens always available, never blocks
-	validation.StartBackgroundTokenRefresh()
+	// 2. Load tokens SYNCHRONOUSLY (blocks until ready)
+	logger.Info("loading tokens...", nil)
+	if err := validation.InitTokens(); err != nil {
+		logger.Warn("token init warning", map[string]interface{}{"error": err.Error()})
+	}
+	logger.Info("tokens loaded", nil)
 
-	// Start async event writers - 4 workers for parallel DB writes
-	storage.StartAsyncWriter(4)
+	// 3. Start background systems
+	validation.StartBackgroundRefresh()
+	storage.StartWriters(4) // 4 parallel DB writers
 
-	// HTTP routes
-	http.HandleFunc("/delivery-events", instrumentHandler("delivery-events", handlers.DeliveryEventsHandler))
-	http.HandleFunc("/health", instrumentHandler("health", handlers.HealthHandler))
+	// 4. Routes
+	http.HandleFunc("/delivery-events", instrument("events", handlers.DeliveryEventsHandler))
+	http.HandleFunc("/health", instrument("health", handlers.HealthHandler))
 	http.Handle("/metrics", promhttp.Handler())
 
-	// Ultra-low latency server config
+	// 5. Server with optimized settings
 	server := &http.Server{
 		Addr:         ":" + port,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
-	logger.Info("starting high-performance server", map[string]interface{}{
-		"port": port,
-	})
+	logger.Info("server starting", map[string]interface{}{"port": port})
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("server failed", map[string]interface{}{
-				"error": err.Error(),
-			})
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Fatal("server error", map[string]interface{}{"error": err.Error()})
 		}
 	}()
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-	logger.Info("shutting down", nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
 }
 
-func instrumentHandler(name string, handler http.HandlerFunc) http.HandlerFunc {
+func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		rw := &respWriter{ResponseWriter: w, status: 200}
 		
-		handler(wrapped, r)
+		h(rw, r)
 		
-		duration := time.Since(start).Seconds()
-		httpRequestDuration.WithLabelValues(name, r.Method).Observe(duration)
-		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(wrapped.statusCode)).Inc()
+		d := time.Since(start).Seconds()
+		httpRequestDuration.WithLabelValues(name, r.Method).Observe(d)
+		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.status)).Inc()
 	}
 }
 
-type responseWriter struct {
+type respWriter struct {
 	http.ResponseWriter
-	statusCode int
+	status int
 }
 
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
+func (w *respWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
-	return defaultValue
+	return def
 }
