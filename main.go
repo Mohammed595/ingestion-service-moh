@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -30,8 +31,8 @@ var (
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "HTTP request duration",
-			Buckets: []float64{.0001, .0005, .001, .005, .01, .05, .1, .5, 1},
+			Help:    "Request duration",
+			Buckets: []float64{.00005, .0001, .0005, .001, .005, .01, .05, .1, .5},
 		},
 		[]string{"handler", "method"},
 	)
@@ -42,44 +43,51 @@ func init() {
 }
 
 func main() {
+	// Maximize CPU usage
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	// Config
 	validation.ControlServerURL = getEnv("CONTROL_SERVER_URL", "http://control-server:9000")
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
 
-	// 1. Initialize database
-	logger.Info("connecting to database", nil)
+	// 1. Initialize database with global connection pool
+	logger.Info("initializing database", nil)
 	if err := storage.InitDatabase(dbURL); err != nil {
 		logger.Fatal("db error", map[string]interface{}{"error": err.Error()})
 	}
 	defer storage.Close()
-	logger.Info("database connected", nil)
 
-	// 2. Load tokens BEFORE accepting traffic
+	// 2. Load tokens synchronously with timeout
 	logger.Info("loading tokens", nil)
 	validation.InitTokens()
-	logger.Info("tokens ready", nil)
 
-	// 3. Start background workers
+	// 3. Start background goroutines
 	validation.StartBackgroundRefresh()
-	storage.StartWriters(8) // 8 parallel DB writers
+	storage.StartWriters(16) // 16 parallel DB writers for maximum throughput
 
 	// 4. Routes
-	http.HandleFunc("/delivery-events", instrument("events", handlers.DeliveryEventsHandler))
-	http.HandleFunc("/health", instrument("health", handlers.HealthHandler))
-	http.Handle("/metrics", promhttp.Handler())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/delivery-events", instrument("events", handlers.DeliveryEventsHandler))
+	mux.HandleFunc("/health", instrument("health", handlers.HealthHandler))
+	mux.Handle("/metrics", promhttp.Handler())
 
-	// 5. High-performance server
+	// 5. High-performance server with aggressive timeouts
 	server := &http.Server{
 		Addr:              ":" + port,
-		ReadTimeout:       3 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-		WriteTimeout:      3 * time.Second,
+		Handler:           mux,
+		ReadTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 500 * time.Millisecond,
+		WriteTimeout:      2 * time.Second,
 		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    1 << 16, // 64KB
+		MaxHeaderBytes:    1 << 15, // 32KB
 	}
 
-	logger.Info("server starting", map[string]interface{}{"port": port})
+	logger.Info("server starting", map[string]interface{}{
+		"port":    port,
+		"workers": 16,
+		"cpus":    runtime.NumCPU(),
+	})
 
 	go func() {
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
@@ -87,15 +95,14 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
+	// Graceful shutdown with timeout
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
-	logger.Info("shutdown complete", nil)
 }
 
 func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
@@ -105,8 +112,7 @@ func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 		
 		h(rw, r)
 		
-		d := time.Since(start).Seconds()
-		httpRequestDuration.WithLabelValues(name, r.Method).Observe(d)
+		httpRequestDuration.WithLabelValues(name, r.Method).Observe(time.Since(start).Seconds())
 		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.status)).Inc()
 	}
 }

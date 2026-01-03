@@ -1,23 +1,39 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"ingestion-service/internal/models"
 	"ingestion-service/internal/storage"
 	"ingestion-service/internal/validation"
 )
 
-// Pre-allocated responses
+// Pre-allocated responses (zero allocation)
 var (
 	okResp     = []byte(`{"status":"ok"}`)
 	healthResp = []byte(`{"status":"healthy"}`)
 )
 
-// DeliveryEventsHandler - main handler
+// sync.Pool for request body buffers
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
+// sync.Pool for DeliveryEvent objects
+var eventObjPool = sync.Pool{
+	New: func() interface{} {
+		return &models.DeliveryEvent{}
+	},
+}
+
+// DeliveryEventsHandler - entry point
 func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
@@ -29,41 +45,45 @@ func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handlePost - ultra-fast POST handler
+// handlePost - ultra-optimized with sync.Pool
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	// 1. Get token (fast header read)
+	// 1. Fast token validation (O(1), no blocking)
 	token := r.Header.Get("X-Platform-Token")
-	
-	// 2. Validate token - O(1), never blocks
 	if !validation.ValidateToken(token) {
 		w.WriteHeader(403)
 		return
 	}
 
-	// 3. Read body
-	body, err := io.ReadAll(r.Body)
+	// 2. Read body using pooled buffer
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
+
+	_, err := io.Copy(buf, r.Body)
 	if err != nil {
 		w.WriteHeader(400)
 		return
 	}
 
-	// 4. Parse event
-	var event models.DeliveryEvent
-	if err := json.Unmarshal(body, &event); err != nil {
+	// 3. Parse JSON using pooled event object
+	event := eventObjPool.Get().(*models.DeliveryEvent)
+	defer eventObjPool.Put(event)
+	
+	if err := json.Unmarshal(buf.Bytes(), event); err != nil {
 		w.WriteHeader(400)
 		return
 	}
 
-	// 5. Queue async (non-blocking)
-	storage.QueueEvent(event, token, "valid")
+	// 4. Queue async (non-blocking, returns immediately)
+	storage.QueueEvent(*event, token, "valid")
 
-	// 6. Immediate success response
+	// 5. Pre-allocated response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(okResp)
 }
 
-// handleGet - GET events
+// handleGet - query with timeout
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -72,7 +92,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	filters := make(map[string]interface{})
+	filters := make(map[string]interface{}, 4)
 	for _, k := range []string{"order_id", "event_type", "customer_id", "restaurant_id"} {
 		if v := r.URL.Query().Get(k); v != "" {
 			filters[k] = v
@@ -89,7 +109,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(events)
 }
 
-// HealthHandler - health check
+// HealthHandler - instant response
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
