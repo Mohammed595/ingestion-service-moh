@@ -36,7 +36,10 @@ jobs:
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Build image
-        run: docker build -t "${{ steps.vars.outputs.image }}" .
+        run: |
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+          docker build -t "${{ steps.vars.outputs.image }}" .
+
 
       - name: Push image
         run: |
