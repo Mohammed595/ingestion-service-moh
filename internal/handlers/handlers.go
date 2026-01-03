@@ -13,31 +13,31 @@ import (
 	"ingestion-service/internal/validation"
 )
 
-// Pre-allocated responses (zero allocation)
+// Pre-allocated responses - zero allocation
 var (
-	okResp     = []byte(`{"status":"ok"}`)
-	healthResp = []byte(`{"status":"healthy"}`)
+	okResponse     = []byte(`{"status":"ok"}`)
+	healthResponse = []byte(`{"status":"healthy"}`)
 )
 
-// sync.Pool for request body buffers
-var bufferPool = sync.Pool{
+// sync.Pool for body buffers - eliminates GC pressure
+var bufPool = sync.Pool{
 	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 4096))
+		return bytes.NewBuffer(make([]byte, 0, 8192))
 	},
 }
 
-// sync.Pool for DeliveryEvent objects
-var eventObjPool = sync.Pool{
+// sync.Pool for event objects
+var eventPool = sync.Pool{
 	New: func() interface{} {
-		return &models.DeliveryEvent{}
+		return new(models.DeliveryEvent)
 	},
 }
 
-// DeliveryEventsHandler - entry point
+// DeliveryEventsHandler - routing
 func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
-		handlePost(w, r)
+		handlePostZeroAlloc(w, r)
 	case "GET":
 		handleGet(w, r)
 	default:
@@ -45,45 +45,52 @@ func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handlePost - ultra-optimized with sync.Pool
-func handlePost(w http.ResponseWriter, r *http.Request) {
-	// 1. Fast token validation (O(1), no blocking)
+// handlePostZeroAlloc - maximum performance POST handler
+func handlePostZeroAlloc(w http.ResponseWriter, r *http.Request) {
+	// 1. Token validation FIRST - O(1), no allocation, no I/O
 	token := r.Header.Get("X-Platform-Token")
 	if !validation.ValidateToken(token) {
 		w.WriteHeader(403)
 		return
 	}
 
-	// 2. Read body using pooled buffer
-	buf := bufferPool.Get().(*bytes.Buffer)
+	// 2. Read body into pooled buffer
+	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	defer bufferPool.Put(buf)
 
 	_, err := io.Copy(buf, r.Body)
 	if err != nil {
+		bufPool.Put(buf)
 		w.WriteHeader(400)
 		return
 	}
 
-	// 3. Parse JSON using pooled event object
-	event := eventObjPool.Get().(*models.DeliveryEvent)
-	defer eventObjPool.Put(event)
+	// 3. Parse into pooled event object
+	event := eventPool.Get().(*models.DeliveryEvent)
+	err = json.Unmarshal(buf.Bytes(), event)
 	
-	if err := json.Unmarshal(buf.Bytes(), event); err != nil {
+	// Return buffer immediately
+	bufPool.Put(buf)
+
+	if err != nil {
+		eventPool.Put(event)
 		w.WriteHeader(400)
 		return
 	}
 
-	// 4. Queue async (non-blocking, returns immediately)
+	// 4. Queue for async write - non-blocking
 	storage.QueueEvent(*event, token, "valid")
+	
+	// Return event to pool
+	eventPool.Put(event)
 
-	// 5. Pre-allocated response
+	// 5. Pre-allocated response - zero allocation
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
-	w.Write(okResp)
+	w.Write(okResponse)
 }
 
-// handleGet - query with timeout
+// handleGet - query endpoint
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -93,10 +100,18 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filters := make(map[string]interface{}, 4)
-	for _, k := range []string{"order_id", "event_type", "customer_id", "restaurant_id"} {
-		if v := r.URL.Query().Get(k); v != "" {
-			filters[k] = v
-		}
+	q := r.URL.Query()
+	if v := q.Get("order_id"); v != "" {
+		filters["order_id"] = v
+	}
+	if v := q.Get("event_type"); v != "" {
+		filters["event_type"] = v
+	}
+	if v := q.Get("customer_id"); v != "" {
+		filters["customer_id"] = v
+	}
+	if v := q.Get("restaurant_id"); v != "" {
+		filters["restaurant_id"] = v
 	}
 
 	events, err := storage.QueryEvents(limit, filters)
@@ -113,5 +128,5 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
-	w.Write(healthResp)
+	w.Write(healthResponse)
 }

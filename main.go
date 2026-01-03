@@ -31,8 +31,8 @@ var (
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "Request duration",
-			Buckets: []float64{.00005, .0001, .0005, .001, .005, .01, .05, .1, .5},
+			Help:    "Request latency",
+			Buckets: []float64{.00001, .00005, .0001, .0005, .001, .005, .01, .05, .1, .5},
 		},
 		[]string{"handler", "method"},
 	)
@@ -43,7 +43,7 @@ func init() {
 }
 
 func main() {
-	// Maximize CPU usage
+	// Maximize parallelism
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Config
@@ -51,56 +51,56 @@ func main() {
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
 
-	// 1. Initialize database with global connection pool
-	logger.Info("initializing database", nil)
+	// 1. Initialize DB with massive connection pool
+	logger.Info("init db", nil)
 	if err := storage.InitDatabase(dbURL); err != nil {
-		logger.Fatal("db error", map[string]interface{}{"error": err.Error()})
+		logger.Fatal("db fail", map[string]interface{}{"e": err.Error()})
 	}
 	defer storage.Close()
 
-	// 2. Load tokens synchronously with timeout
-	logger.Info("loading tokens", nil)
+	// 2. Load tokens synchronously (fast)
+	logger.Info("init tokens", nil)
 	validation.InitTokens()
 
-	// 3. Start background goroutines
+	// 3. Start background systems
 	validation.StartBackgroundRefresh()
-	storage.StartWriters(16) // 16 parallel DB writers for maximum throughput
+	storage.StartWriters(32) // 32 parallel DB writers!
 
-	// 4. Routes
+	// 4. Routes with minimal overhead
 	mux := http.NewServeMux()
-	mux.HandleFunc("/delivery-events", instrument("events", handlers.DeliveryEventsHandler))
-	mux.HandleFunc("/health", instrument("health", handlers.HealthHandler))
+	mux.HandleFunc("/delivery-events", instrument("ev", handlers.DeliveryEventsHandler))
+	mux.HandleFunc("/health", instrument("hp", handlers.HealthHandler))
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// 5. High-performance server with aggressive timeouts
+	// 5. Ultra-low latency server config
 	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           mux,
-		ReadTimeout:       2 * time.Second,
-		ReadHeaderTimeout: 500 * time.Millisecond,
-		WriteTimeout:      2 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    1 << 15, // 32KB
+		ReadTimeout:       1500 * time.Millisecond,
+		ReadHeaderTimeout: 200 * time.Millisecond,
+		WriteTimeout:      1500 * time.Millisecond,
+		IdleTimeout:       15 * time.Second,
+		MaxHeaderBytes:    1 << 14, // 16KB
 	}
 
-	logger.Info("server starting", map[string]interface{}{
+	logger.Info("starting", map[string]interface{}{
 		"port":    port,
-		"workers": 16,
+		"workers": 32,
 		"cpus":    runtime.NumCPU(),
 	})
 
 	go func() {
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Fatal("server error", map[string]interface{}{"error": err.Error()})
+			logger.Fatal("server fail", map[string]interface{}{"e": err.Error()})
 		}
 	}()
 
-	// Graceful shutdown with timeout
+	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
 }
@@ -108,23 +108,21 @@ func main() {
 func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rw := &statusWriter{ResponseWriter: w, status: 200}
-		
+		rw := &sw{ResponseWriter: w, s: 200}
 		h(rw, r)
-		
 		httpRequestDuration.WithLabelValues(name, r.Method).Observe(time.Since(start).Seconds())
-		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.status)).Inc()
+		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.s)).Inc()
 	}
 }
 
-type statusWriter struct {
+type sw struct {
 	http.ResponseWriter
-	status int
+	s int
 }
 
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
+func (w *sw) WriteHeader(c int) {
+	w.s = c
+	w.ResponseWriter.WriteHeader(c)
 }
 
 func getEnv(k, d string) string {
