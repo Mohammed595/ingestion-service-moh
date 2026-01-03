@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,11 +62,48 @@ func main() {
 	http.HandleFunc("/health", instrumentHandler("health", handlers.HealthHandler))
 	http.Handle("/metrics", promhttp.Handler())
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	// Configure optimized HTTP server for high performance
+	server := &http.Server{
+		Addr:         ":" + port,
+		ReadTimeout:  10 * time.Second,  // Max time to read request
+		WriteTimeout: 10 * time.Second,  // Max time to write response
+		IdleTimeout:  120 * time.Second, // Keep-alive timeout
+	}
+
+	logger.Info("starting optimized HTTP server", map[string]interface{}{
+		"port":          port,
+		"read_timeout":  "10s",
+		"write_timeout": "10s",
+		"idle_timeout":  "120s",
+	})
+
+	// Start server with graceful shutdown handling
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("server failed", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	}()
+
+	// Wait for interrupt signal for graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	<-c
+	logger.Info("shutting down server", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("server shutdown failed", map[string]interface{}{
 			"error": err.Error(),
 		})
+		os.Exit(1)
 	}
+
+	logger.Info("server shutdown complete", nil)
 }
 
 // instrumentHandler wraps an HTTP handler with Prometheus instrumentation

@@ -24,3 +24,13 @@ CREATE INDEX IF NOT EXISTS idx_received_at ON events(received_at);
 CREATE INDEX IF NOT EXISTS idx_validation_status ON events(validation_status);
 CREATE INDEX IF NOT EXISTS idx_customer_id ON events(customer_id);
 CREATE INDEX IF NOT EXISTS idx_restaurant_id ON events(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_driver_id ON events(driver_id);
+CREATE INDEX IF NOT EXISTS idx_platform_token ON events(platform_token);
+
+-- Composite indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_order_event_time ON events(order_id, event_type, event_timestamp);
+CREATE INDEX IF NOT EXISTS idx_customer_received ON events(customer_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_restaurant_time ON events(restaurant_id, event_timestamp);
+
+-- Partial index for analytics queries (only valid events)
+CREATE INDEX IF NOT EXISTS idx_valid_events_time ON events(event_timestamp) WHERE validation_status = 'valid';
