@@ -6,20 +6,24 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"ingestion-service/internal/models"
 
 	_ "github.com/lib/pq"
+	"golang.org/x/sync/errgroup"
 )
 
 var DB *sql.DB
 
-// Pre-built query template for batch inserts
-var insertPrefix = `INSERT INTO events (order_id,event_type,event_timestamp,received_at,customer_id,restaurant_id,driver_id,location_lat,location_lng,platform_token,validation_status,validation_error) VALUES `
+// Global Connection Pool
+const (
+	MaxConns    = 100
+	IdleConns   = 100
+	MaxBatch    = 256
+	FlushInter  = 20 * time.Millisecond
+)
 
-// Event entry - fixed size struct for cache efficiency
 type eventEntry struct {
 	OrderID        string
 	EventType      string
@@ -34,16 +38,23 @@ type eventEntry struct {
 	Status         string
 }
 
-// Lock-free ring buffer using channels
-var eventChan = make(chan eventEntry, 200000) // 200K capacity
-
-// Metrics
+// sync.Pools for zero-allocation batching
 var (
-	eventsQueued  atomic.Int64
-	eventsWritten atomic.Int64
+	eventPool = sync.Pool{New: func() interface{} { return &eventEntry{} }}
+	batchPool = sync.Pool{New: func() interface{} { 
+		b := make([]eventEntry, 0, MaxBatch)
+		return &b 
+	}}
+	argsPool = sync.Pool{New: func() interface{} { 
+		a := make([]interface{}, 0, MaxBatch*12)
+		return &a 
+	}}
 )
 
-// QueueEvent - zero blocking, always returns immediately
+// Channel for buffering events - large enough to handle bursts
+var eventChan = make(chan eventEntry, 200000)
+
+// QueueEvent - non-blocking ingestion
 func QueueEvent(event models.DeliveryEvent, token, status string) {
 	select {
 	case eventChan <- eventEntry{
@@ -59,116 +70,87 @@ func QueueEvent(event models.DeliveryEvent, token, status string) {
 		Token:          token,
 		Status:         status,
 	}:
-		eventsQueued.Add(1)
 	default:
-		// Full buffer - drop to maintain latency
+		// Drop events if channel is full to protect latency
 	}
 }
 
-// sync.Pool for batch slices - zero allocation in hot path
-var batchPool = sync.Pool{
-	New: func() interface{} {
-		s := make([]eventEntry, 0, 512)
-		return &s
-	},
-}
-
-// sync.Pool for string builders
-var builderPool = sync.Pool{
-	New: func() interface{} {
-		return &strings.Builder{}
-	},
-}
-
-// sync.Pool for args slices
-var argsPool = sync.Pool{
-	New: func() interface{} {
-		s := make([]interface{}, 0, 6144) // 512 * 12
-		return &s
-	},
-}
-
-// StartWriters - parallel goroutine writers
-func StartWriters(n int) {
+// StartWriters - uses errgroup to manage parallel background writers
+func StartWriters(ctx context.Context, g *errgroup.Group, n int) {
 	for i := 0; i < n; i++ {
-		go writerLoop()
+		g.Go(func() error {
+			return writerLoop(ctx)
+		})
 	}
 }
 
-func writerLoop() {
+func writerLoop(ctx context.Context) error {
 	batchPtr := batchPool.Get().(*[]eventEntry)
 	batch := (*batchPtr)[:0]
+	defer batchPool.Put(batchPtr)
 
-	ticker := time.NewTicker(15 * time.Millisecond) // Aggressive flush
+	ticker := time.NewTicker(FlushInter)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			if len(batch) > 0 {
+				flushBatch(batch)
+			}
+			return ctx.Err()
 		case e := <-eventChan:
 			batch = append(batch, e)
-
-			// Drain aggressively
-		drain:
-			for len(batch) < 512 {
-				select {
-				case e := <-eventChan:
-					batch = append(batch, e)
-				default:
-					break drain
-				}
+			if len(batch) >= MaxBatch {
+				flushBatch(batch)
+				batch = batch[:0]
 			}
-
 		case <-ticker.C:
-			// Time-based flush
-		}
-
-		if len(batch) > 0 {
-			fastBatchInsert(batch)
-			eventsWritten.Add(int64(len(batch)))
-			batch = batch[:0]
+			if len(batch) > 0 {
+				flushBatch(batch)
+				batch = batch[:0]
+			}
 		}
 	}
 }
 
-func fastBatchInsert(events []eventEntry) {
+// Pre-allocated query fragments
+const insertQueryPrefix = `INSERT INTO events (order_id, event_type, event_timestamp, received_at, customer_id, restaurant_id, driver_id, location_lat, location_lng, platform_token, validation_status, validation_error) VALUES `
+
+func flushBatch(events []eventEntry) {
 	if len(events) == 0 || DB == nil {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Get pooled resources
 	argsPtr := argsPool.Get().(*[]interface{})
 	args := (*argsPtr)[:0]
-	
-	sb := builderPool.Get().(*strings.Builder)
-	sb.Reset()
-	sb.Grow(len(insertPrefix) + len(events)*120) // Pre-allocate
-	sb.WriteString(insertPrefix)
+	defer argsPool.Put(argsPtr)
 
-	defer func() {
-		*argsPtr = args[:0]
-		argsPool.Put(argsPtr)
-		sb.Reset()
-		builderPool.Put(sb)
-	}()
+	var sb strings.Builder
+	sb.Grow(len(insertQueryPrefix) + len(events)*120)
+	sb.WriteString(insertQueryPrefix)
 
 	for i, e := range events {
 		if i > 0 {
-			sb.WriteByte(',')
+			sb.WriteString(",")
 		}
-		n := i * 12
-		fmt.Fprintf(sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12)
+		offset := i * 12
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			offset+1, offset+2, offset+3, offset+4, offset+5, offset+6,
+			offset+7, offset+8, offset+9, offset+10, offset+11, offset+12)
+		
 		args = append(args, e.OrderID, e.EventType, e.EventTimestamp, e.ReceivedAt,
-			e.CustomerID, e.RestaurantID, e.DriverID, e.Lat, e.Lng, e.Token, e.Status, "")
+			e.CustomerID, e.RestaurantID, e.DriverID, e.Lat, e.Lng,
+			e.Token, e.Status, "")
 	}
 
-	DB.ExecContext(ctx, sb.String(), args...)
+	_, _ = DB.ExecContext(ctx, sb.String(), args...)
 }
 
-// Legacy compatibility
+// Compatibility layer
 func StoreEvent(event models.DeliveryEvent, token, status string) error {
 	QueueEvent(event, token, status)
 	return nil
@@ -181,63 +163,44 @@ func StoreEventsBatch(events []models.DeliveryEvent, token, status string) error
 	return nil
 }
 
-// QueryEvents with aggressive timeout
 func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEvent, error) {
-	if DB == nil {
-		return nil, nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	var sb strings.Builder
-	sb.WriteString(`SELECT id,order_id,event_type,event_timestamp,received_at,customer_id,restaurant_id,driver_id,location_lat,location_lng,platform_token,validation_status,COALESCE(validation_error,'') FROM events`)
+	query := `SELECT id, order_id, event_type, event_timestamp, received_at, customer_id, restaurant_id, driver_id, location_lat, location_lng, platform_token, validation_status, COALESCE(validation_error, '') FROM events`
+	
+	var args []interface{}
+	var conds []string
+	n := 1
 
-	args := make([]interface{}, 0, 5)
-	n := 0
-
-	if len(filters) > 0 {
-		sb.WriteString(" WHERE ")
-		first := true
-		for k, v := range filters {
-			if s, ok := v.(string); ok && s != "" {
-				if !first {
-					sb.WriteString(" AND ")
-				}
-				n++
-				fmt.Fprintf(&sb, "%s=$%d", k, n)
-				args = append(args, s)
-				first = false
-			}
+	for k, v := range filters {
+		if s, ok := v.(string); ok && s != "" {
+			conds = append(conds, fmt.Sprintf("%s=$%d", k, n))
+			args = append(args, s)
+			n++
 		}
 	}
 
-	n++
-	fmt.Fprintf(&sb, " ORDER BY id DESC LIMIT $%d", n)
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", n)
 	args = append(args, limit)
 
-	rows, err := DB.QueryContext(ctx, sb.String(), args...)
+	rows, err := DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	events := make([]models.StoredEvent, 0, limit)
+	var results []models.StoredEvent
 	for rows.Next() {
 		var e models.StoredEvent
-		rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt,
-			&e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng,
-			&e.PlatformToken, &e.ValidationStatus, &e.ValidationError)
-		events = append(events, e)
+		if err := rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt, &e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng, &e.PlatformToken, &e.ValidationStatus, &e.ValidationError); err == nil {
+			results = append(results, e)
+		}
 	}
-	return events, nil
-}
-
-func Close() {
-	time.Sleep(50 * time.Millisecond) // Brief drain
-	if DB != nil {
-		DB.Close()
-	}
+	return results, nil
 }
 
 func InitDatabase(url string) error {
@@ -246,14 +209,18 @@ func InitDatabase(url string) error {
 	if err != nil {
 		return err
 	}
-
-	// Maximum connection pool
-	DB.SetMaxOpenConns(150)
-	DB.SetMaxIdleConns(150)
-	DB.SetConnMaxLifetime(3 * time.Minute)
-	DB.SetConnMaxIdleTime(1 * time.Minute)
-
+	
+	DB.SetMaxOpenConns(MaxConns)
+	DB.SetMaxIdleConns(IdleConns)
+	DB.SetConnMaxLifetime(5 * time.Minute)
+	
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return DB.PingContext(ctx)
+}
+
+func Close() {
+	if DB != nil {
+		DB.Close()
+	}
 }

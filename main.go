@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sync/errgroup"
 
 	"ingestion-service/internal/handlers"
 	"ingestion-service/internal/logger"
@@ -23,7 +24,7 @@ var (
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
-			Help: "Total HTTP requests",
+			Help: "Total number of HTTP requests",
 		},
 		[]string{"handler", "method", "status"},
 	)
@@ -31,98 +32,124 @@ var (
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "Request latency",
-			Buckets: []float64{.00001, .00005, .0001, .0005, .001, .005, .01, .05, .1, .5},
+			Help:    "HTTP request duration in seconds",
+			Buckets: []float64{.0001, .0005, .001, .005, .01, .025, .05, .1, .25, .5},
 		},
 		[]string{"handler", "method"},
 	)
 )
 
 func init() {
-	prometheus.MustRegister(httpRequestsTotal, httpRequestDuration)
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
 }
 
 func main() {
-	// Maximize parallelism
+	// 1. Runtime tuning
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Config
+	// 2. Load configuration
 	validation.ControlServerURL = getEnv("CONTROL_SERVER_URL", "http://control-server:9000")
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
 
-	// 1. Initialize DB with massive connection pool
-	logger.Info("init db", nil)
+	// 3. Global resources init
 	if err := storage.InitDatabase(dbURL); err != nil {
-		logger.Fatal("db fail", map[string]interface{}{"e": err.Error()})
+		logger.Fatal("db init failed", map[string]interface{}{"error": err.Error()})
 	}
 	defer storage.Close()
 
-	// 2. Load tokens synchronously (fast)
-	logger.Info("init tokens", nil)
-	validation.InitTokens()
+	if err := validation.InitTokens(); err != nil {
+		logger.Warn("token init warning", map[string]interface{}{"error": err.Error()})
+	}
 
-	// 3. Start background systems
+	// 4. Start background systems via errgroup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Background refresh
 	validation.StartBackgroundRefresh()
-	storage.StartWriters(32) // 32 parallel DB writers!
 
-	// 4. Routes with minimal overhead
+	// Parallel writers (32 parallel DB writers for maximum RPS)
+	storage.StartWriters(ctx, g, 32)
+
+	// 5. Optimized server setup
 	mux := http.NewServeMux()
-	mux.HandleFunc("/delivery-events", instrument("ev", handlers.DeliveryEventsHandler))
-	mux.HandleFunc("/health", instrument("hp", handlers.HealthHandler))
+	mux.HandleFunc("/delivery-events", instrumentHandler("ev", handlers.DeliveryEventsHandler))
+	mux.HandleFunc("/health", instrumentHandler("hp", handlers.HealthHandler))
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// 5. Ultra-low latency server config
 	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           mux,
-		ReadTimeout:       1500 * time.Millisecond,
-		ReadHeaderTimeout: 200 * time.Millisecond,
-		WriteTimeout:      1500 * time.Millisecond,
-		IdleTimeout:       15 * time.Second,
-		MaxHeaderBytes:    1 << 14, // 16KB
+		ReadTimeout:       1 * time.Second,
+		ReadHeaderTimeout: 500 * time.Millisecond,
+		WriteTimeout:      1 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
-	logger.Info("starting", map[string]interface{}{
-		"port":    port,
-		"workers": 32,
-		"cpus":    runtime.NumCPU(),
+	logger.Info("ingestion service starting", map[string]interface{}{
+		"port": port,
+		"cpus": runtime.NumCPU(),
 	})
 
-	go func() {
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Fatal("server fail", map[string]interface{}{"e": err.Error()})
+	// Start server
+	g.Go(func() error {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
 		}
-	}()
+		return nil
+	})
 
-	// Graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	// 6. Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	
+	select {
+	case sig := <-sigChan:
+		logger.Info("received signal, shutting down", map[string]interface{}{"signal": sig.String()})
+	case <-ctx.Done():
+		logger.Info("context cancelled, shutting down", nil)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
+	cancel() // Trigger background system shutdown
+	
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("server shutdown failed", map[string]interface{}{"error": err.Error()})
+	}
+
+	// Wait for background writers to finish flushing
+	if err := g.Wait(); err != nil && err != context.Canceled {
+		logger.Error("background system failure", map[string]interface{}{"error": err.Error()})
+	}
+
+	logger.Info("shutdown complete", nil)
 }
 
-func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
+func instrumentHandler(name string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rw := &sw{ResponseWriter: w, s: 200}
+		rw := &statusWriter{ResponseWriter: w, status: 200}
 		h(rw, r)
-		httpRequestDuration.WithLabelValues(name, r.Method).Observe(time.Since(start).Seconds())
-		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.s)).Inc()
+		duration := time.Since(start).Seconds()
+		httpRequestDuration.WithLabelValues(name, r.Method).Observe(duration)
+		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(rw.status)).Inc()
 	}
 }
 
-type sw struct {
+type statusWriter struct {
 	http.ResponseWriter
-	s int
+	status int
 }
 
-func (w *sw) WriteHeader(c int) {
-	w.s = c
-	w.ResponseWriter.WriteHeader(c)
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func getEnv(k, d string) string {

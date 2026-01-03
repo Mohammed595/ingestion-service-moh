@@ -3,143 +3,115 @@ package validation
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var ControlServerURL string
 
-// Global optimized transport - connection reuse, no allocation per request
-var globalTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: (&net.Dialer{
-		Timeout:   500 * time.Millisecond,
-		KeepAlive: 30 * time.Second,
-		DualStack: true,
-	}).DialContext,
-	ForceAttemptHTTP2:     false, // HTTP/1.1 is faster for small requests
-	MaxIdleConns:          200,
-	MaxIdleConnsPerHost:   200,
-	MaxConnsPerHost:       200,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   500 * time.Millisecond,
-	ExpectContinueTimeout: 100 * time.Millisecond,
-	DisableCompression:    true,
-	DisableKeepAlives:     false,
-}
-
+// Global optimized HTTP client for connection reuse
 var httpClient = &http.Client{
-	Transport: globalTransport,
-	Timeout:   1500 * time.Millisecond,
+	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   1 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   1 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
+	},
 }
 
-// Token storage - lock-free atomic operations
+// Atomic value for lock-free map access
 var (
 	tokenMap    atomic.Value // map[string]struct{}
 	tokensReady atomic.Bool
-	tokenMu     sync.Mutex
 )
-
-// sync.Pool for response body reading
-var bodyPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 0, 8192)
-		return &b
-	},
-}
 
 func init() {
 	tokenMap.Store(make(map[string]struct{}))
 }
 
-// InitTokens - blocking init with fast timeout
-func InitTokens() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+// InitTokens - fast synchronous initialization
+func InitTokens() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	for i := 0; i < 15; i++ {
-		if loadTokensFast(ctx) {
+	for i := 0; i < 10; i++ {
+		if loadTokens(ctx) {
 			tokensReady.Store(true)
-			return
+			return nil
 		}
 		select {
 		case <-ctx.Done():
 			tokensReady.Store(true)
-			return
-		case <-time.After(50 * time.Millisecond):
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 	tokensReady.Store(true)
+	return nil
 }
 
-// StartBackgroundRefresh - non-blocking background refresh
+// StartBackgroundRefresh - keeps the cache hot without blocking requests
 func StartBackgroundRefresh() {
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
 		for range ticker.C {
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			loadTokensFast(ctx)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			loadTokens(ctx)
 			cancel()
 		}
 	}()
 }
 
-func loadTokensFast(ctx context.Context) bool {
+func loadTokens(ctx context.Context) bool {
 	req, _ := http.NewRequestWithContext(ctx, "GET", ControlServerURL+"/platform-tokens", nil)
-	req.Header.Set("Connection", "keep-alive")
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return false
 	}
+	defer resp.Body.Close()
 
-	// Read body with pooled buffer
-	bufPtr := bodyPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0]
-	defer func() {
-		*bufPtr = buf[:0]
-		bodyPool.Put(bufPtr)
-	}()
-
-	buf, err = io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if err != nil || resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return false
 	}
 
 	var result struct {
 		PlatformTokens []string `json:"platform_tokens"`
 	}
-	if json.Unmarshal(buf, &result) != nil || len(result.PlatformTokens) == 0 {
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return false
 	}
 
-	// Build map atomically
-	m := make(map[string]struct{}, len(result.PlatformTokens))
+	newMap := make(map[string]struct{}, len(result.PlatformTokens))
 	for _, t := range result.PlatformTokens {
-		m[t] = struct{}{}
+		newMap[t] = struct{}{}
 	}
-
-	tokenMu.Lock()
-	tokenMap.Store(m)
-	tokenMu.Unlock()
+	tokenMap.Store(newMap)
 	return true
 }
 
-// ValidateToken - O(1) lock-free, zero allocation
+// ValidateToken - ultra-fast O(1) lock-free check
 func ValidateToken(token string) bool {
-	if len(token) == 0 {
+	if token == "" {
 		return false
 	}
+	// Fail-open during startup to prevent 503s
 	if !tokensReady.Load() {
 		return true
 	}
 	m := tokenMap.Load().(map[string]struct{})
+	// Fail-open if map is somehow empty
 	if len(m) == 0 {
 		return true
 	}
@@ -147,14 +119,14 @@ func ValidateToken(token string) bool {
 	return ok
 }
 
-// Legacy
+// Compatibility wrappers
 func FetchPlatformTokens() ([]string, error) {
 	m := tokenMap.Load().(map[string]struct{})
-	r := make([]string, 0, len(m))
+	res := make([]string, 0, len(m))
 	for t := range m {
-		r = append(r, t)
+		res = append(res, t)
 	}
-	return r, nil
+	return res, nil
 }
 
 func ValidatePlatformToken(token string, _ []string) bool {

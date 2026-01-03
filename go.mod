@@ -1,10 +1,11 @@
 module ingestion-service
 
-go 1.21
+go 1.24.0
 
 require (
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.17.0
+	golang.org/x/sync v0.19.0
 )
 
 require (

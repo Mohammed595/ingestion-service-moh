@@ -13,110 +13,92 @@ import (
 	"ingestion-service/internal/validation"
 )
 
-// Pre-allocated responses - zero allocation
+// sync.Pools for zero-allocation handling
+var (
+	bufPool = sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, 4096))
+		},
+	}
+	eventObjPool = sync.Pool{
+		New: func() interface{} {
+			return &models.DeliveryEvent{}
+		},
+	}
+)
+
 var (
 	okResponse     = []byte(`{"status":"ok"}`)
 	healthResponse = []byte(`{"status":"healthy"}`)
 )
 
-// sync.Pool for body buffers - eliminates GC pressure
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 8192))
-	},
-}
-
-// sync.Pool for event objects
-var eventPool = sync.Pool{
-	New: func() interface{} {
-		return new(models.DeliveryEvent)
-	},
-}
-
-// DeliveryEventsHandler - routing
+// DeliveryEventsHandler - Refactored for ultra-high performance
 func DeliveryEventsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-	case "POST":
-		handlePostZeroAlloc(w, r)
-	case "GET":
+	case http.MethodPost:
+		handlePostFast(w, r)
+	case http.MethodGet:
 		handleGet(w, r)
 	default:
-		w.WriteHeader(405)
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-// handlePostZeroAlloc - maximum performance POST handler
-func handlePostZeroAlloc(w http.ResponseWriter, r *http.Request) {
-	// 1. Token validation FIRST - O(1), no allocation, no I/O
+func handlePostFast(w http.ResponseWriter, r *http.Request) {
+	// 1. Fast token check (O(1), no I/O)
 	token := r.Header.Get("X-Platform-Token")
 	if !validation.ValidateToken(token) {
-		w.WriteHeader(403)
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 
-	// 2. Read body into pooled buffer
+	// 2. Body reading using pooled buffer
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
+	defer bufPool.Put(buf)
 
-	_, err := io.Copy(buf, r.Body)
-	if err != nil {
-		bufPool.Put(buf)
-		w.WriteHeader(400)
+	if _, err := io.Copy(buf, r.Body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	// 3. Parse into pooled event object
-	event := eventPool.Get().(*models.DeliveryEvent)
-	err = json.Unmarshal(buf.Bytes(), event)
-	
-	// Return buffer immediately
-	bufPool.Put(buf)
+	// 3. JSON unmarshal using pooled object
+	event := eventObjPool.Get().(*models.DeliveryEvent)
+	defer eventObjPool.Put(event)
 
-	if err != nil {
-		eventPool.Put(event)
-		w.WriteHeader(400)
+	if err := json.Unmarshal(buf.Bytes(), event); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	// 4. Queue for async write - non-blocking
+	// 4. Async queueing (non-blocking)
 	storage.QueueEvent(*event, token, "valid")
-	
-	// Return event to pool
-	eventPool.Put(event)
 
-	// 5. Pre-allocated response - zero allocation
+	// 5. Direct response write (pre-allocated)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.Write(okResponse)
 }
 
-// handleGet - query endpoint
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if l, _ := strconv.Atoi(v); l > 0 && l <= 1000 {
+		if l, err := strconv.Atoi(v); err == nil && l > 0 && l <= 1000 {
 			limit = l
 		}
 	}
 
-	filters := make(map[string]interface{}, 4)
+	filters := make(map[string]interface{})
 	q := r.URL.Query()
-	if v := q.Get("order_id"); v != "" {
-		filters["order_id"] = v
-	}
-	if v := q.Get("event_type"); v != "" {
-		filters["event_type"] = v
-	}
-	if v := q.Get("customer_id"); v != "" {
-		filters["customer_id"] = v
-	}
-	if v := q.Get("restaurant_id"); v != "" {
-		filters["restaurant_id"] = v
+	for _, k := range []string{"order_id", "event_type", "customer_id", "restaurant_id"} {
+		if v := q.Get(k); v != "" {
+			filters[k] = v
+		}
 	}
 
 	events, err := storage.QueryEvents(limit, filters)
 	if err != nil {
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -124,9 +106,8 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(events)
 }
 
-// HealthHandler - instant response
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	w.Write(healthResponse)
 }
