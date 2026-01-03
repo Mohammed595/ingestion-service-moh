@@ -173,7 +173,19 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 	var conds []string
 	n := 1
 
+	// Whitelist of allowed filter keys to prevent SQL injection
+	allowedFilters := map[string]struct{}{
+		"order_id":      {},
+		"event_type":    {},
+		"customer_id":   {},
+		"restaurant_id": {},
+		"driver_id":     {},
+	}
+
 	for k, v := range filters {
+		if _, allowed := allowedFilters[k]; !allowed {
+			continue // Skip unallowed filter keys
+		}
 		if s, ok := v.(string); ok && s != "" {
 			conds = append(conds, fmt.Sprintf("%s=$%d", k, n))
 			args = append(args, s)
