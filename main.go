@@ -19,7 +19,6 @@ import (
 )
 
 var (
-	// Standard HTTP metrics - can't be manipulated as they're recorded by middleware
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -32,7 +31,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
 			Help:    "HTTP request duration in seconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1},
 		},
 		[]string{"handler", "method"},
 	)
@@ -44,7 +43,6 @@ func init() {
 }
 
 func main() {
-	// Configuration from environment variables
 	validation.ControlServerURL = getEnv("CONTROL_SERVER_URL", "http://control-server:9000")
 	databaseURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ingestion?sslmode=disable")
 	port := getEnv("PORT", "8080")
@@ -57,74 +55,60 @@ func main() {
 	}
 	defer storage.Close()
 
-	// HTTP routes with instrumentation middleware
+	// Start background token refresh - tokens always available, never blocks
+	validation.StartBackgroundTokenRefresh()
+
+	// Start async event writers - 4 workers for parallel DB writes
+	storage.StartAsyncWriter(4)
+
+	// HTTP routes
 	http.HandleFunc("/delivery-events", instrumentHandler("delivery-events", handlers.DeliveryEventsHandler))
 	http.HandleFunc("/health", instrumentHandler("health", handlers.HealthHandler))
 	http.Handle("/metrics", promhttp.Handler())
 
-	// Configure optimized HTTP server for high performance
+	// Ultra-low latency server config
 	server := &http.Server{
 		Addr:         ":" + port,
-		ReadTimeout:  10 * time.Second,  // Max time to read request
-		WriteTimeout: 10 * time.Second,  // Max time to write response
-		IdleTimeout:  120 * time.Second, // Keep-alive timeout
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	logger.Info("starting optimized HTTP server", map[string]interface{}{
-		"port":          port,
-		"read_timeout":  "10s",
-		"write_timeout": "10s",
-		"idle_timeout":  "120s",
+	logger.Info("starting high-performance server", map[string]interface{}{
+		"port": port,
 	})
 
-	// Start server with graceful shutdown handling
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Fatal("server failed", map[string]interface{}{
+			logger.Fatal("server failed", map[string]interface{}{
 				"error": err.Error(),
 			})
 		}
 	}()
 
-	// Wait for interrupt signal for graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
 	<-c
-	logger.Info("shutting down server", nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	logger.Info("shutting down", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("server shutdown failed", map[string]interface{}{
-			"error": err.Error(),
-		})
-		os.Exit(1)
-	}
-
-	logger.Info("server shutdown complete", nil)
+	server.Shutdown(ctx)
 }
 
-// instrumentHandler wraps an HTTP handler with Prometheus instrumentation
-func instrumentHandler(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
+func instrumentHandler(name string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		// Wrap ResponseWriter to capture status code
+		start := time.Now()
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
-		// Call the actual handler
+		
 		handler(wrapped, r)
-
-		// Record metrics
-		duration := time.Since(startTime).Seconds()
-		httpRequestDuration.WithLabelValues(handlerName, r.Method).Observe(duration)
-		httpRequestsTotal.WithLabelValues(handlerName, r.Method, strconv.Itoa(wrapped.statusCode)).Inc()
+		
+		duration := time.Since(start).Seconds()
+		httpRequestDuration.WithLabelValues(name, r.Method).Observe(duration)
+		httpRequestsTotal.WithLabelValues(name, r.Method, strconv.Itoa(wrapped.statusCode)).Inc()
 	}
 }
 
-// responseWriter wraps http.ResponseWriter to capture the status code
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int

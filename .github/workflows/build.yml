@@ -41,6 +41,7 @@ jobs:
           docker build -t "${{ steps.vars.outputs.image }}" .
 
 
+
       - name: Push image
         run: |
           gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet

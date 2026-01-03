@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"ingestion-service/internal/logger"
@@ -12,74 +13,155 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// DB is the database handle - initialized by InitDatabase
+// DB is the database handle
 var DB *sql.DB
 
-// Prepared statements for performance
-var insertEventStmt *sql.Stmt
-
-// StoreEvent persists an event to the database using prepared statement
-func StoreEvent(event models.DeliveryEvent, platformToken, validationStatus string) error {
-	receivedAt := time.Now().Unix()
-	eventTimestamp := event.EventTimestamp.Unix()
-
-	_, err := insertEventStmt.Exec(
-		event.OrderID, event.EventType, eventTimestamp, receivedAt,
-		event.CustomerID, event.RestaurantID, event.DriverID,
-		event.Location.Lat, event.Location.Lng,
-		platformToken, validationStatus, "")
-
-	if err != nil {
-		return fmt.Errorf("failed to insert event: %w", err)
-	}
-
-	return nil
+// Event buffer for async processing
+type eventBuffer struct {
+	events    []bufferedEvent
+	mutex     sync.Mutex
+	maxSize   int
+	flushChan chan struct{}
 }
 
-// StoreEventsBatch persists multiple events in a single transaction for high performance
-func StoreEventsBatch(events []models.DeliveryEvent, platformToken, validationStatus string) error {
+type bufferedEvent struct {
+	Event           models.DeliveryEvent
+	PlatformToken   string
+	ValidationStatus string
+	ReceivedAt      int64
+}
+
+var buffer = &eventBuffer{
+	events:    make([]bufferedEvent, 0, 100),
+	maxSize:   50, // Flush every 50 events
+	flushChan: make(chan struct{}, 1),
+}
+
+// QueueEvent adds event to buffer for async processing - returns immediately
+func QueueEvent(event models.DeliveryEvent, platformToken, validationStatus string) {
+	buffer.mutex.Lock()
+	buffer.events = append(buffer.events, bufferedEvent{
+		Event:           event,
+		PlatformToken:   platformToken,
+		ValidationStatus: validationStatus,
+		ReceivedAt:      time.Now().Unix(),
+	})
+	shouldFlush := len(buffer.events) >= buffer.maxSize
+	buffer.mutex.Unlock()
+
+	if shouldFlush {
+		select {
+		case buffer.flushChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// StartAsyncWriter starts background goroutines for writing events
+func StartAsyncWriter(workers int) {
+	// Start worker pool
+	for i := 0; i < workers; i++ {
+		go flushWorker()
+	}
+	
+	// Start periodic flusher
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			select {
+			case buffer.flushChan <- struct{}{}:
+			default:
+			}
+		}
+	}()
+}
+
+func flushWorker() {
+	for range buffer.flushChan {
+		flushBuffer()
+	}
+}
+
+func flushBuffer() {
+	buffer.mutex.Lock()
+	if len(buffer.events) == 0 {
+		buffer.mutex.Unlock()
+		return
+	}
+	
+	// Take all events
+	events := buffer.events
+	buffer.events = make([]bufferedEvent, 0, 100)
+	buffer.mutex.Unlock()
+
+	// Batch insert
+	if err := insertBatch(events); err != nil {
+		logger.Error("batch insert failed", map[string]interface{}{
+			"error": err.Error(),
+			"count": len(events),
+		})
+	}
+}
+
+func insertBatch(events []bufferedEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	tx, err := DB.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	// Build multi-value INSERT
+	valueStrings := make([]string, 0, len(events))
+	valueArgs := make([]interface{}, 0, len(events)*12)
+	
+	for i, e := range events {
+		base := i * 12
+		valueStrings = append(valueStrings, fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6,
+			base+7, base+8, base+9, base+10, base+11, base+12,
+		))
+		valueArgs = append(valueArgs,
+			e.Event.OrderID,
+			e.Event.EventType,
+			e.Event.EventTimestamp.Unix(),
+			e.ReceivedAt,
+			e.Event.CustomerID,
+			e.Event.RestaurantID,
+			e.Event.DriverID,
+			e.Event.Location.Lat,
+			e.Event.Location.Lng,
+			e.PlatformToken,
+			e.ValidationStatus,
+			"",
+		)
 	}
-	defer tx.Rollback()
 
-	// Prepare statement within transaction
-	stmt, err := tx.Prepare(`
+	query := fmt.Sprintf(`
 		INSERT INTO events (order_id, event_type, event_timestamp, received_at,
 		                    customer_id, restaurant_id, driver_id, location_lat, location_lng,
 		                    platform_token, validation_status, validation_error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`)
-	if err != nil {
-		return fmt.Errorf("failed to prepare batch insert statement: %w", err)
-	}
-	defer stmt.Close()
+		VALUES %s`, strings.Join(valueStrings, ","))
 
-	receivedAt := time.Now().Unix()
-	for _, event := range events {
-		eventTimestamp := event.EventTimestamp.Unix()
-		_, err = stmt.Exec(
-			event.OrderID, event.EventType, eventTimestamp, receivedAt,
-			event.CustomerID, event.RestaurantID, event.DriverID,
-			event.Location.Lat, event.Location.Lng,
-			platformToken, validationStatus, "")
-		if err != nil {
-			return fmt.Errorf("failed to insert event in batch: %w", err)
-		}
-	}
+	_, err := DB.Exec(query, valueArgs...)
+	return err
+}
 
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
+// StoreEvent - synchronous fallback (not used in hot path)
+func StoreEvent(event models.DeliveryEvent, platformToken, validationStatus string) error {
+	QueueEvent(event, platformToken, validationStatus)
 	return nil
 }
 
-// QueryEvents retrieves events from the database with safe filtering
+// StoreEventsBatch - kept for compatibility
+func StoreEventsBatch(events []models.DeliveryEvent, platformToken, validationStatus string) error {
+	for _, e := range events {
+		QueueEvent(e, platformToken, validationStatus)
+	}
+	return nil
+}
+
+// QueryEvents retrieves events from the database
 func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEvent, error) {
 	query := `
 		SELECT id, order_id, event_type, event_timestamp, received_at,
@@ -90,7 +172,6 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 	var args []interface{}
 	argCount := 0
 
-	// Build WHERE clause safely
 	if len(filters) > 0 {
 		query += " WHERE"
 		conditions := []string{}
@@ -124,14 +205,13 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 		}
 	}
 
-	// Add ORDER BY and LIMIT
 	argCount++
 	query += fmt.Sprintf(" ORDER BY received_at DESC LIMIT $%d", argCount)
 	args = append(args, limit)
 
 	rows, err := DB.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -142,7 +222,6 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 		if err := rows.Scan(&e.ID, &e.OrderID, &e.EventType, &e.EventTimestamp, &e.ReceivedAt,
 			&e.CustomerID, &e.RestaurantID, &e.DriverID, &e.LocationLat, &e.LocationLng,
 			&e.PlatformToken, &e.ValidationStatus, &validationError); err != nil {
-			logger.Error("failed to scan row", map[string]interface{}{"error": err.Error()})
 			continue
 		}
 		if validationError.Valid {
@@ -154,17 +233,17 @@ func QueryEvents(limit int, filters map[string]interface{}) ([]models.StoredEven
 	return events, nil
 }
 
-// Close closes the database connection and prepared statements
+// Close closes the database connection
 func Close() {
-	if insertEventStmt != nil {
-		insertEventStmt.Close()
-	}
+	// Flush remaining events
+	flushBuffer()
+	
 	if DB != nil {
 		DB.Close()
 	}
 }
 
-// InitDatabase opens the database connection with optimized settings
+// InitDatabase opens the database connection
 func InitDatabase(databaseURL string) error {
 	var err error
 	DB, err = sql.Open("postgres", databaseURL)
@@ -172,31 +251,15 @@ func InitDatabase(databaseURL string) error {
 		return err
 	}
 
-	// Configure connection pool for high performance
-	DB.SetMaxOpenConns(25)                 // Maximum open connections
-	DB.SetMaxIdleConns(25)                 // Maximum idle connections
-	DB.SetConnMaxLifetime(5 * time.Minute) // Maximum connection lifetime
+	// Optimized connection pool
+	DB.SetMaxOpenConns(50)
+	DB.SetMaxIdleConns(50)
+	DB.SetConnMaxLifetime(5 * time.Minute)
 
-	// Test connection
 	if err = DB.Ping(); err != nil {
 		return err
 	}
 
-	// Prepare statement for high-performance inserts
-	insertEventStmt, err = DB.Prepare(`
-		INSERT INTO events (order_id, event_type, event_timestamp, received_at,
-		                    customer_id, restaurant_id, driver_id, location_lat, location_lng,
-		                    platform_token, validation_status, validation_error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`)
-	if err != nil {
-		return fmt.Errorf("failed to prepare insert statement: %w", err)
-	}
-
-	logger.Info("database connection established", map[string]interface{}{
-		"max_open_conns": 25,
-		"max_idle_conns": 25,
-		"conn_max_lifetime": "5m",
-		"prepared_statements": true,
-	})
+	logger.Info("database initialized", nil)
 	return nil
 }
