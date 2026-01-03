@@ -1,4 +1,4 @@
-FROM golang:1.21 AS builder
+FROM europe-west1-docker.pkg.dev/hungerstation-hackathon-6957/build-day-25-repo/golang:1.21 AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY . .
 # Build the application
 RUN CGO_ENABLED=0 go build -o ingestion-service .
 
-FROM debian:bookworm-slim
+FROM europe-west1-docker.pkg.dev/hungerstation-hackathon-6957/build-day-25-repo/debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
